@@ -18,139 +18,121 @@ app.add_middleware(
     allow_headers=["*"],   # 全ヘッダーを許可する（これも超重要）
 )
 
+def is_strict_side_view(landmarks, mp_pose, tol_deg=10):
+    # 肩と腰で体幹平面を定義
+    ls = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
+    rs = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+    lh = landmarks[mp_pose.PoseLandmark.LEFT_HIP]
+    # 信頼度チェック
+    if ls.visibility < 0.7 or rs.visibility < 0.7 or lh.visibility < 0.7:
+        return False
+    # 3Dベクトル化
+    v1 = np.array([rs.x - ls.x, rs.y - ls.y, rs.z - ls.z])
+    v2 = np.array([lh.x - ls.x, lh.y - ls.y, lh.z - ls.z])
+    normal = np.cross(v1, v2)
+    norm = np.linalg.norm(normal)
+    if norm < 1e-6:
+        return False
+    normal /= norm
+    # カメラ視線ベクトルをZ軸とみなす
+    cam_axis = np.array([0, 0, 1])
+    angle = np.degrees(np.arccos(np.clip(np.dot(normal, cam_axis), -1.0, 1.0)))
+    return abs(angle - 90.0) <= tol_deg
+
 @app.post("/upload")
 async def upload_video(file: UploadFile = File(...)):
+    # 動画を一時保存
     tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tmp_file.write(await file.read())
     tmp_file.close()
 
     cap = cv2.VideoCapture(tmp_file.name)
-    mp_pose = mp.solutions.pose
+    mp_pose = __import__('mediapipe').solutions.pose
     pose = mp_pose.Pose(static_image_mode=False)
 
-    left_contact = False
-    right_contact = False
-    left_monitoring = False
-    right_monitoring = False
+    # パラメータ
+    window_size = 3
+    side_window = deque(maxlen=window_size)
+    heel_speed_thresh = 0.005
+    heel_height_offset = 0.02
+    ankle_height_thresh = 0.5
+    horizontal_thresh = 0.05
+    knee_angle_thresh = 178.0
+    tol_side_deg = 10
 
     prev_left_heel_y = None
     prev_right_heel_y = None
-
-    left_window = deque(maxlen=5)
-    right_window = deque(maxlen=5)
-    window_size = 5
-    violation_threshold = 3
-
-    movement_threshold = 0.1
-    prev_landmarks = None
-
+    frame_index = 0
     violation_frame = None
     violation_side = None
-    frame_index = 0
 
     while True:
-        success, frame = cap.read()
-        if not success:
+        ret, frame = cap.read()
+        if not ret:
             break
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = pose.process(frame_rgb)
-
-        if result.pose_landmarks:
-            landmarks = result.pose_landmarks.landmark
-
-            if prev_landmarks is not None:
-                movements = []
-                for side in ('LEFT','RIGHT'):
-                    for part in ('HIP','KNEE','ANKLE','HEEL'):
-                        idx = getattr(mp_pose.PoseLandmark, f"{side}_{part}")
-                        dx = landmarks[idx].x - prev_landmarks[idx].x
-                        dy = landmarks[idx].y - prev_landmarks[idx].y
-                        dz = landmarks[idx].z - prev_landmarks[idx].z
-                        movements.append(np.linalg.norm([dx, dy, dz]))
-                if max(movements) > movement_threshold:
-                    prev_landmarks = landmarks
-                    frame_index += 1
-                    continue
-            prev_landmarks = landmarks
-
-            l_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP]
-            l_knee = landmarks[mp_pose.PoseLandmark.LEFT_KNEE]
-            l_ankle = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE]
-            l_heel = landmarks[mp_pose.PoseLandmark.LEFT_HEEL]
-
-            r_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP]
-            r_knee = landmarks[mp_pose.PoseLandmark.RIGHT_KNEE]
-            r_ankle = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
-            r_heel = landmarks[mp_pose.PoseLandmark.RIGHT_HEEL]
-
-            left_heel_speed = abs(l_heel.y - prev_left_heel_y) if prev_left_heel_y is not None else 1.0
-            right_heel_speed = abs(r_heel.y - prev_right_heel_y) if prev_right_heel_y is not None else 1.0
-
-            if not left_contact:
-                if left_heel_speed < 0.005 and l_heel.y > l_ankle.y + 0.02:
-                    left_contact = True
-                    left_monitoring = True
-            elif left_monitoring:
-                if l_ankle.y > 0.5:
-                    knee_angle = calculate_3d_angle(l_hip, l_knee, l_ankle)
-                    horiz_alignment = abs(l_hip.x - l_ankle.x) < 0.05
-                    line_angle = calculate_3d_angle(l_hip, l_knee, l_ankle)
-                    vert_alignment = line_angle > 178
-                    violation_flag = (knee_angle < 178) and (line_angle < 178) and horiz_alignment
-                    left_window.append(violation_flag)
-
-                    if len(left_window) == window_size and sum(left_window) >= violation_threshold:
-                        violation_frame = frame.copy()
-                        violation_side = "left"
-                        break
-
-                if horiz_alignment and vert_alignment:
-                    left_contact = False
-                    left_monitoring = False
-                    left_window.clear()
-
-            if not right_contact:
-                if right_heel_speed < 0.005 and r_heel.y > r_ankle.y + 0.02:
-                    right_contact = True
-                    right_monitoring = True
-            elif right_monitoring:
-                if r_ankle.y > 0.5:
-                    knee_angle = calculate_3d_angle(r_hip, r_knee, r_ankle)
-                    horiz_alignment = abs(r_hip.x - r_ankle.x) < 0.05
-                    line_angle = calculate_3d_angle(r_hip, r_knee, r_ankle)
-                    vert_alignment = line_angle > 178
-                    violation_flag = (knee_angle < 178) and (line_angle < 178) and horiz_alignment
-                    right_window.append(violation_flag)
-
-                    if len(right_window) == window_size and sum(right_window) >= violation_threshold:
-                        violation_frame = frame.copy()
-                        violation_side = "right"
-                        break
-
-                if horiz_alignment and vert_alignment:
-                    right_contact = False
-                    right_monitoring = False
-                    right_window.clear()
-
-            prev_left_heel_y = l_heel.y
-            prev_right_heel_y = r_heel.y
-
         frame_index += 1
+        if not result.pose_landmarks:
+            continue
+
+        lm = result.pose_landmarks.landmark
+        # サイドビュー判定
+        side_ok = is_strict_side_view(lm, mp_pose, tol_deg=tol_side_deg)
+        side_window.append(side_ok)
+        if len(side_window) < window_size or not all(side_window):
+            continue
+
+        # ランドマーク取得
+        l_hip   = lm[mp_pose.PoseLandmark.LEFT_HIP]
+        l_knee  = lm[mp_pose.PoseLandmark.LEFT_KNEE]
+        l_ankle = lm[mp_pose.PoseLandmark.LEFT_ANKLE]
+        l_heel  = lm[mp_pose.PoseLandmark.LEFT_HEEL]
+        r_hip   = lm[mp_pose.PoseLandmark.RIGHT_HIP]
+        r_knee  = lm[mp_pose.PoseLandmark.RIGHT_KNEE]
+        r_ankle = lm[mp_pose.PoseLandmark.RIGHT_ANKLE]
+        r_heel  = lm[mp_pose.PoseLandmark.RIGHT_HEEL]
+
+        # かかと速度計算
+        left_speed  = abs(l_heel.y - prev_left_heel_y)  if prev_left_heel_y is not None else 1.0
+        right_speed = abs(r_heel.y - prev_right_heel_y) if prev_right_heel_y is not None else 1.0
+
+        # 左足接地判定＆膝チェック
+        if left_speed < heel_speed_thresh and (l_heel.y > l_ankle.y + heel_height_offset):
+            if l_ankle.y > ankle_height_thresh and abs(l_hip.x - l_ankle.x) < horizontal_thresh:
+                angle = calculate_3d_angle(l_hip, l_knee, l_ankle)
+                if angle < knee_angle_thresh:
+                    violation_frame = frame.copy()
+                    violation_side = "left"
+                    break
+
+        # 右足接地判定＆膝チェック
+        if right_speed < heel_speed_thresh and (r_heel.y > r_ankle.y + heel_height_offset):
+            if r_ankle.y > ankle_height_thresh and abs(r_hip.x - r_ankle.x) < horizontal_thresh:
+                angle = calculate_3d_angle(r_hip, r_knee, r_ankle)
+                if angle < knee_angle_thresh:
+                    violation_frame = frame.copy()
+                    violation_side = "right"
+                    break
+
+        prev_left_heel_y  = l_heel.y
+        prev_right_heel_y = r_heel.y
 
     cap.release()
     os.remove(tmp_file.name)
-    
+
     if violation_frame is not None:
-        _, buffer = cv2.imencode('.jpg', violation_frame)
-        img_b64 = base64.b64encode(buffer).decode('utf-8')
+        _, buf = cv2.imencode('.jpg', violation_frame)
+        img_b64 = base64.b64encode(buf).decode('utf-8')
         return {
-            "message": f"{violation_side} foot detected knee bend violation.",
+            "message": f"{violation_side} foot knee bend violation at strict side view.",
             "frame": frame_index,
             "image_base64": img_b64
         }
 
-    return {"message": "Knee extension is compliant."}
+    return {"message": "Knee extension compliant at strict side views only."}
+
 
 def calculate_3d_angle(a, b, c):
     p1 = np.array([a.x, a.y, a.z])
@@ -160,4 +142,3 @@ def calculate_3d_angle(a, b, c):
     v2 = p3 - p2
     cos_ang = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
     return np.degrees(np.arccos(np.clip(cos_ang, -1.0, 1.0)))
-
