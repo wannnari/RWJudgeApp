@@ -18,47 +18,68 @@ app.add_middleware(
     allow_headers=["*"],   # 全ヘッダーを許可する（これも超重要）
 )
 
-def is_strict_side_view(landmarks, mp_pose, tol_deg=10):
-    # 肩と腰で体幹平面を定義
-    ls = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
-    rs = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
-    lh = landmarks[mp_pose.PoseLandmark.LEFT_HIP]
-    # 信頼度チェック
-    if ls.visibility < 0.7 or rs.visibility < 0.7 or lh.visibility < 0.7:
-        return False
-    # 3Dベクトル化
-    v1 = np.array([rs.x - ls.x, rs.y - ls.y, rs.z - ls.z])
-    v2 = np.array([lh.x - ls.x, lh.y - ls.y, lh.z - ls.z])
-    normal = np.cross(v1, v2)
-    norm = np.linalg.norm(normal)
-    if norm < 1e-6:
-        return False
-    normal /= norm
-    # カメラ視線ベクトルをZ軸とみなす
-    cam_axis = np.array([0, 0, 1])
-    angle = np.degrees(np.arccos(np.clip(np.dot(normal, cam_axis), -1.0, 1.0)))
-    return abs(angle - 90.0) <= tol_deg
+# MediaPipe 初期化
+mp_pose = mp.solutions.pose
+mp_face = mp.solutions.face_mesh
+pose = mp_pose.Pose(static_image_mode=False)
+face_mesh = mp_face.FaceMesh(static_image_mode=False, max_num_faces=1, min_detection_confidence=0.5)
+
+# Head pose モデルポイント (mm 単位の参考モデル)
+MODEL_POINTS = np.array([
+    (0.0, 0.0, 0.0),        # Nose tip
+    (0.0, -63.6, -12.5),    # Chin
+    (-43.3, 32.7, -26.0),   # Left eye left corner
+    (43.3, 32.7, -26.0),    # Right eye right corner
+    (-28.9, -28.9, -24.1),  # Left mouth corner
+    (28.9, -28.9, -24.1)    # Right mouth corner
+], dtype='double')
+
+def get_head_yaw(frame, face_landmarks):
+    h, w = frame.shape[:2]
+    image_points = np.array([
+        (face_landmarks.landmark[1].x * w, face_landmarks.landmark[1].y * h),       # Nose tip
+        (face_landmarks.landmark[152].x * w, face_landmarks.landmark[152].y * h),   # Chin
+        (face_landmarks.landmark[33].x * w, face_landmarks.landmark[33].y * h),     # Left eye corner
+        (face_landmarks.landmark[263].x * w, face_landmarks.landmark[263].y * h),   # Right eye corner
+        (face_landmarks.landmark[61].x * w, face_landmarks.landmark[61].y * h),     # Left mouth
+        (face_landmarks.landmark[291].x * w, face_landmarks.landmark[291].y * h)    # Right mouth
+    ], dtype='double')
+    # カメラ行列 (焦点距離は幅を代用)
+    focal_length = w
+    center = (w / 2, h / 2)
+    camera_matrix = np.array([
+        [focal_length, 0, center[0]],
+        [0, focal_length, center[1]],
+        [0, 0, 1]
+    ], dtype='double')
+    dist_coeffs = np.zeros((4, 1))
+    success, rvec, tvec = cv2.solvePnP(MODEL_POINTS, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE)
+    if not success:
+        return None
+    # 回転ベクトルを行列に変換してオイラー角取得
+    rmat, _ = cv2.Rodrigues(rvec)
+    proj = np.hstack((rmat, tvec))
+    _, _, _, _, _, _, euler = cv2.decomposeProjectionMatrix(proj)
+    yaw = euler[1][0]
+    return yaw
 
 @app.post("/upload")
 async def upload_video(file: UploadFile = File(...)):
-    # 動画を一時保存
     tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tmp_file.write(await file.read())
     tmp_file.close()
 
     cap = cv2.VideoCapture(tmp_file.name)
-    mp_pose = __import__('mediapipe').solutions.pose
-    pose = mp_pose.Pose(static_image_mode=False)
 
-    # パラメータ
+    # 判定パラメータ
     window_size = 3
     side_window = deque(maxlen=window_size)
-    heel_speed_thresh = 0.005
-    heel_height_offset = 0.02
-    ankle_height_thresh = 0.5
-    horizontal_thresh = 0.05
-    knee_angle_thresh = 178.0
-    tol_side_deg = 10
+    heel_speed_thresh = 0.002      # かかと速度閾値を厳しく
+    heel_height_offset = 0.03      # かかと高さオフセットを増加
+    ankle_height_thresh = 0.6      # 足首高さを厳しく
+    horizontal_thresh = 0.03       # X差閾値を厳しく
+    knee_angle_thresh = 175.0      # 膝角度閾値を厳しく
+    yaw_side_tol = 5.0             # Yaw の許容角度を狭める    # Yaw が 90°±tol の場合のみサイド
 
     prev_left_heel_y = None
     prev_right_heel_y = None
@@ -70,35 +91,44 @@ async def upload_video(file: UploadFile = File(...)):
         ret, frame = cap.read()
         if not ret:
             break
-
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = pose.process(frame_rgb)
-        frame_index += 1
-        if not result.pose_landmarks:
+
+        # Head pose 推定
+        face_res = face_mesh.process(frame_rgb)
+        if not face_res.multi_face_landmarks:
+            frame_index += 1
+            continue
+        yaw = get_head_yaw(frame, face_res.multi_face_landmarks[0])
+        if yaw is None or abs(abs(yaw) - 90.0) > yaw_side_tol:
+            frame_index += 1
             continue
 
-        lm = result.pose_landmarks.landmark
-        # サイドビュー判定
-        side_ok = is_strict_side_view(lm, mp_pose, tol_deg=tol_side_deg)
-        side_window.append(side_ok)
-        if len(side_window) < window_size or not all(side_window):
+        # Pose 推定
+        res = pose.process(frame_rgb)
+        if not res.pose_landmarks:
+            frame_index += 1
             continue
+        lm = res.pose_landmarks.landmark
 
         # ランドマーク取得
-        l_hip   = lm[mp_pose.PoseLandmark.LEFT_HIP]
-        l_knee  = lm[mp_pose.PoseLandmark.LEFT_KNEE]
-        l_ankle = lm[mp_pose.PoseLandmark.LEFT_ANKLE]
-        l_heel  = lm[mp_pose.PoseLandmark.LEFT_HEEL]
-        r_hip   = lm[mp_pose.PoseLandmark.RIGHT_HIP]
-        r_knee  = lm[mp_pose.PoseLandmark.RIGHT_KNEE]
-        r_ankle = lm[mp_pose.PoseLandmark.RIGHT_ANKLE]
-        r_heel  = lm[mp_pose.PoseLandmark.RIGHT_HEEL]
+        l_hip, l_knee, l_ankle, l_heel = (
+            lm[mp_pose.PoseLandmark.LEFT_HIP],
+            lm[mp_pose.PoseLandmark.LEFT_KNEE],
+            lm[mp_pose.PoseLandmark.LEFT_ANKLE],
+            lm[mp_pose.PoseLandmark.LEFT_HEEL]
+        )
+        r_hip, r_knee, r_ankle, r_heel = (
+            lm[mp_pose.PoseLandmark.RIGHT_HIP],
+            lm[mp_pose.PoseLandmark.RIGHT_KNEE],
+            lm[mp_pose.PoseLandmark.RIGHT_ANKLE],
+            lm[mp_pose.PoseLandmark.RIGHT_HEEL]
+        )
 
-        # かかと速度計算
-        left_speed  = abs(l_heel.y - prev_left_heel_y)  if prev_left_heel_y is not None else 1.0
+        # かかと速度
+        left_speed = abs(l_heel.y - prev_left_heel_y)  if prev_left_heel_y is not None else 1.0
         right_speed = abs(r_heel.y - prev_right_heel_y) if prev_right_heel_y is not None else 1.0
 
-        # 左足接地判定＆膝チェック
+        # 左足判定
         if left_speed < heel_speed_thresh and (l_heel.y > l_ankle.y + heel_height_offset):
             if l_ankle.y > ankle_height_thresh and abs(l_hip.x - l_ankle.x) < horizontal_thresh:
                 angle = calculate_3d_angle(l_hip, l_knee, l_ankle)
@@ -107,7 +137,7 @@ async def upload_video(file: UploadFile = File(...)):
                     violation_side = "left"
                     break
 
-        # 右足接地判定＆膝チェック
+        # 右足判定
         if right_speed < heel_speed_thresh and (r_heel.y > r_ankle.y + heel_height_offset):
             if r_ankle.y > ankle_height_thresh and abs(r_hip.x - r_ankle.x) < horizontal_thresh:
                 angle = calculate_3d_angle(r_hip, r_knee, r_ankle)
@@ -118,6 +148,7 @@ async def upload_video(file: UploadFile = File(...)):
 
         prev_left_heel_y  = l_heel.y
         prev_right_heel_y = r_heel.y
+        frame_index += 1
 
     cap.release()
     os.remove(tmp_file.name)
@@ -130,7 +161,6 @@ async def upload_video(file: UploadFile = File(...)):
             "frame": frame_index,
             "image_base64": img_b64
         }
-
     return {"message": "Knee extension compliant at strict side views only."}
 
 
